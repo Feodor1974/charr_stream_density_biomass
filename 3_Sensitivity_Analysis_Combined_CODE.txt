@@ -1,0 +1,220 @@
+"""
+Sensitivity_Analysis_N0.py
+Поиск перекоса в N0: поочередное смещение n_spawn, fecundity, egg_surv
+Модель: combined mortality (2 параметра: beta0, W1)
+"""
+
+import pandas as pd
+import numpy as np
+import pymc as pm
+import arviz as az
+from scipy.optimize import differential_evolution
+import warnings
+warnings.filterwarnings('ignore')
+
+# ============================================================
+# 1. ЧТЕНИЕ ДАННЫХ
+# ============================================================
+
+df = pd.read_excel('Combined_M.xlsx', header=0)
+df = df.set_index('Parameters')
+
+params = {}
+for morph in ['Nosed', 'White']:
+    params[morph] = {
+        'm0': df.loc['lambda_Age 0+', morph],
+        'm1': df.loc['lambda_Age 1+', morph],
+        'm2': df.loc['lambda_Age 2+', morph],
+        'M_min': df.loc['M_min_0+', morph],
+        'M_max': df.loc['M_max_0+', morph],
+        'W_min': df.loc['W\u2081_min_1+', morph],
+        'W_max': df.loc['W\u2081_max_1+', morph],
+        'n_spawn_min': df.loc['n_spawners_min', morph],
+        'n_spawn_max': df.loc['n_spawners_max', morph],
+        'fec_min': df.loc['fecundity_min', morph],
+        'fec_max': df.loc['fecundity_max', morph],
+        'egg_mort_min': df.loc['egg_mortality_min', morph],
+        'egg_mort_max': df.loc['egg_mortality_max', morph],
+    }
+
+for morph in ['Nosed', 'White']:
+    p = params[morph]
+    n_spawn = (p['n_spawn_min'] + p['n_spawn_max']) / 2
+    fec = (p['fec_min'] + p['fec_max']) / 2
+    egg_surv = 1 - (p['egg_mort_min'] + p['egg_mort_max']) / 2
+    p['N0_base'] = n_spawn * fec * egg_surv
+    p['lambda0'] = p['m0'] / p['N0_base']
+    p['n_spawn_base'] = n_spawn
+    p['fec_base'] = fec
+    p['egg_surv_base'] = egg_surv
+
+print("=== BASE DATA ===")
+for morph in ['Nosed', 'White']:
+    p = params[morph]
+    print(f"\n{morph}: N0={p['N0_base']:.1f}, lambda0={p['lambda0']:.4f}")
+    print(f"  n_spawn={p['n_spawn_base']:.1f}, fec={p['fec_base']:.1f}, egg_surv={p['egg_surv_base']:.4f}")
+    print(f"  m0={p['m0']:.0f}, m1={p['m1']:.0f}, m2={p['m2']:.0f}")
+
+# ============================================================
+# 2. ОПТИМИЗАЦИЯ ГРАНИЦ (baseline)
+# ============================================================
+
+def level1_objective(bounds, params, delta=0.05):
+    M_min, M_max, W_min, W_max = bounds
+    if M_min >= M_max or W_min >= W_max or M_min <= W_max + delta:
+        return 1e10
+    total_obj = 0
+    for morph in ['Nosed', 'White']:
+        p = params[morph]
+        lambda0 = p['lambda0']
+        beta0_min = max(0.001, 1 - M_max - lambda0)
+        beta0_max = 1 - M_min - lambda0
+        if beta0_min >= beta0_max:
+            total_obj += 1e6
+            continue
+        beta0_test = np.linspace(beta0_min, beta0_max, 1000)
+        lambda1_vals = p['m1'] / (p['N0_base'] * beta0_test)
+        beta1_vals = p['m2'] / (p['N0_base'] * beta0_test)
+        W1_vals = 1 - beta1_vals - lambda1_vals
+        M0_vals = 1 - beta0_test - lambda0
+        feasible = (W1_vals >= W_min) & (W1_vals <= W_max) & (M0_vals > W1_vals + delta)
+        if not np.any(feasible):
+            total_obj += 1e6
+            continue
+        idx = np.where(feasible)[0][len(np.where(feasible)[0])//2]
+        beta0 = beta0_test[idx]
+        lambda1 = p['m1'] / (p['N0_base'] * beta0)
+        beta1 = p['m2'] / (p['N0_base'] * beta0)
+        m1_model = p['N0_base'] * beta0 * lambda1
+        m2_model = p['N0_base'] * beta0 * beta1
+        total_obj += ((m1_model - p['m1'])/p['m1'])**2 + ((m2_model - p['m2'])/p['m2'])**2
+    return total_obj
+
+result_level1 = differential_evolution(
+    level1_objective, [(0.05,0.5), (0.3,0.95), (0.05,0.5), (0.05,0.5)],
+    args=(params, 0.05), seed=42, maxiter=300, tol=1e-8, polish=True
+)
+M_min_opt, M_max_opt, W1_min_opt, W1_max_opt = result_level1.x
+
+print(f"\nCommon bounds: M0=[{M_min_opt:.3f}, {M_max_opt:.3f}], W1=[{W1_min_opt:.3f}, {W1_max_opt:.3f}]")
+
+# ============================================================
+# 3. BAYESIAN MODEL (для sensitivity по N0)
+# ============================================================
+
+def run_model_N0(p, M_min, M_max, W1_min, W1_max,
+                 n_spawn_shift=1.0, fec_shift=1.0, egg_surv_shift=1.0,
+                 delta=0.05):
+    """
+    n_spawn_shift, fec_shift, egg_surv_shift: множители (1.0 = baseline)
+    """
+    n_spawn_s = p['n_spawn_base'] * n_spawn_shift
+    fec_s = p['fec_base'] * fec_shift
+    egg_surv_s = p['egg_surv_base'] * egg_surv_shift
+    N0_fixed = n_spawn_s * fec_s * egg_surv_s
+    lambda0_s = p['m0'] / N0_fixed
+
+    beta0_min = max(0.001, 1 - M_max - lambda0_s)
+    beta0_max = 1 - M_min - lambda0_s
+
+    with pm.Model() as model:
+        beta0 = pm.Uniform('beta0', lower=beta0_min, upper=beta0_max)
+        W1 = pm.Uniform('W1', lower=W1_min, upper=W1_max)
+        lambda1 = pm.Deterministic('lambda1', p['m1'] / (N0_fixed * beta0))
+        beta1 = pm.Deterministic('beta1', 1 - W1 - lambda1)
+        M0 = pm.Deterministic('M0', 1 - beta0 - lambda0_s)
+        pred_m2 = N0_fixed * beta0 * (1 - W1 - lambda1)
+        pm.Normal('likelihood_m2', mu=pred_m2, sigma=0.05 * p['m2'], observed=p['m2'])
+        pm.Normal('pseudo_m2', mu=pred_m2 - p['m2'], sigma=16000, observed=0)
+        pm.Potential('M0_gt_W1', -10000 * pm.math.switch(M0 > W1 + delta, 0, (W1 + delta - M0)**2))
+        trace = pm.sample(2000, tune=1000, chains=4, cores=4,
+                         return_inferencedata=True, target_accept=0.95, random_seed=42)
+    return trace, N0_fixed, lambda0_s
+
+# ============================================================
+# 4. SENSITIVITY ANALYSIS ПО N0
+# ============================================================
+
+shift_values = [-0.3, -0.2, -0.1, 0.0, 0.1, 0.2, 0.3]
+shift_vars = ['n_spawn', 'fec', 'egg_surv']
+
+all_rows = []
+
+for morph in ['Nosed', 'White']:
+    p = params[morph]
+    print(f"\n=== {morph} ===")
+
+    for shift_var in shift_vars:
+        for shift_pct in shift_values:
+            n_spawn_s = 1.0 + (shift_pct if shift_var == 'n_spawn' else 0)
+            fec_s = 1.0 + (shift_pct if shift_var == 'fec' else 0)
+            egg_surv_s = 1.0 + (shift_pct if shift_var == 'egg_surv' else 0)
+
+            try:
+                trace, N0_new, lambda0_new = run_model_N0(
+                    p, M_min_opt, M_max_opt, W1_min_opt, W1_max_opt,
+                    n_spawn_s, fec_s, egg_surv_s
+                )
+                summary = az.summary(trace, var_names=['beta0', 'W1', 'M0', 'beta1', 'lambda1'], hdi_prob=0.95)
+                rhat_max = summary['r_hat'].max()
+                ess_min = summary['ess_bulk'].min()
+                divergences = trace.sample_stats.diverging.sum().values
+
+                row = {
+                    'Morph': morph,
+                    'Shift_var': shift_var,
+                    'Shift_pct': int(shift_pct * 100),
+                    'N0_new': N0_new,
+                    'lambda0_new': lambda0_new,
+                    'beta0_mean': summary.loc['beta0', 'mean'],
+                    'W1_mean': summary.loc['W1', 'mean'],
+                    'M0_mean': summary.loc['M0', 'mean'],
+                    'beta1_mean': summary.loc['beta1', 'mean'],
+                    'lambda1_mean': summary.loc['lambda1', 'mean'],
+                    'beta0_hdi_width': summary.loc['beta0', 'hdi_97.5%'] - summary.loc['beta0', 'hdi_2.5%'],
+                    'W1_hdi_width': summary.loc['W1', 'hdi_97.5%'] - summary.loc['W1', 'hdi_2.5%'],
+                    'rhat_max': rhat_max,
+                    'ess_min': ess_min,
+                    'divergences': divergences,
+                    'stable': rhat_max < 1.01 and divergences == 0 and ess_min > 400
+                }
+                all_rows.append(row)
+                print(f"  {shift_var} {int(shift_pct*100):+d}%: N0={N0_new:.0f}, lambda0={lambda0_new:.4f}, "
+                      f"beta0={row['beta0_mean']:.4f}, W1={row['W1_mean']:.4f}, "
+                      f"rhat={rhat_max:.3f}, div={divergences}, stable={row['stable']}")
+            except Exception as e:
+                all_rows.append({
+                    'Morph': morph, 'Shift_var': shift_var, 'Shift_pct': int(shift_pct * 100),
+                    'N0_new': np.nan, 'lambda0_new': np.nan,
+                    'beta0_mean': np.nan, 'W1_mean': np.nan, 'M0_mean': np.nan,
+                    'beta1_mean': np.nan, 'lambda1_mean': np.nan,
+                    'beta0_hdi_width': np.nan, 'W1_hdi_width': np.nan,
+                    'rhat_max': np.nan, 'ess_min': np.nan, 'divergences': np.nan,
+                    'stable': False, 'error': str(e)[:50]
+                })
+                print(f"  {shift_var} {int(shift_pct*100):+d}%: ERROR - {str(e)[:50]}")
+
+# ============================================================
+# 5. СОХРАНЕНИЕ
+# ============================================================
+
+df_results = pd.DataFrame(all_rows)
+df_results.to_excel('Sensitivity_N0_Results.xlsx', index=False)
+
+print("\n=== ГОТОВО ===")
+print("Сохранено: Sensitivity_N0_Results.xlsx")
+print(f"Всего сценариев: {len(all_rows)}")
+
+# Сводка
+print("\n=== СВОДКА ПО СТАБИЛЬНОСТИ ===")
+for morph in ['Nosed', 'White']:
+    df_m = df_results[df_results['Morph'] == morph]
+    unstable = df_m[~df_m['stable']]
+    print(f"\n{morph}:")
+    print(f"  Stable: {df_m['stable'].sum()}/{len(df_m)}")
+    if len(unstable) > 0:
+        print(f"  Unstable shifts:")
+        for _, r in unstable.iterrows():
+            print(f"    {r['Shift_var']} {r['Shift_pct']:+d}%: rhat={r['rhat_max']:.3f}, div={r['divergences']}")
+    else:
+        print(f"  All stable")
