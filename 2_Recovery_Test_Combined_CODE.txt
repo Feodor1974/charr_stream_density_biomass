@@ -1,0 +1,316 @@
+"""
+Recovery_Test_W1param_v2.py
+Recovery test: только свободные параметры (beta0, W1)
+Deterministic (beta1, lambda1, M0) не проверяются отдельно
+Выход: Recovery_Results_v2.xlsx
+"""
+
+import pandas as pd
+import numpy as np
+import pymc as pm
+import arviz as az
+from scipy.optimize import differential_evolution
+import warnings
+warnings.filterwarnings('ignore')
+
+# ============================================================
+# 1. ЧТЕНИЕ ДАННЫХ
+# ============================================================
+
+df = pd.read_excel('Combined_M.xlsx', header=0)
+df = df.set_index('Parameters')
+
+params = {}
+for morph in ['Nosed', 'White']:
+    params[morph] = {
+        'm0': df.loc['lambda_Age 0+', morph],
+        'm1': df.loc['lambda_Age 1+', morph],
+        'm2': df.loc['lambda_Age 2+', morph],
+        'M_min': df.loc['M_min_0+', morph],
+        'M_max': df.loc['M_max_0+', morph],
+        'W_min': df.loc['W₁_min_1+', morph],
+        'W_max': df.loc['W₁_max_1+', morph],
+        'n_spawn_min': df.loc['n_spawners_min', morph],
+        'n_spawn_max': df.loc['n_spawners_max', morph],
+        'fec_min': df.loc['fecundity_min', morph],
+        'fec_max': df.loc['fecundity_max', morph],
+        'egg_mort_min': df.loc['egg_mortality_min', morph],
+        'egg_mort_max': df.loc['egg_mortality_max', morph],
+    }
+
+for morph in ['Nosed', 'White']:
+    p = params[morph]
+    n_spawn = (p['n_spawn_min'] + p['n_spawn_max']) / 2
+    fec = (p['fec_min'] + p['fec_max']) / 2
+    egg_surv = 1 - (p['egg_mort_min'] + p['egg_mort_max']) / 2
+    p['N0_base'] = n_spawn * fec * egg_surv
+
+# ============================================================
+# 2. ОПТИМИЗАЦИЯ ГРАНИЦ
+# ============================================================
+
+def level1_objective(bounds, params, delta=0.05):
+    M_min, M_max, W_min, W_max = bounds
+    if M_min >= M_max or W_min >= W_max or M_min <= W_max + delta:
+        return 1e10
+    total_obj = 0
+    for morph in ['Nosed', 'White']:
+        p = params[morph]
+        lambda0 = p['m0'] / p['N0_base']
+        beta0_min = max(0.001, 1 - M_max - lambda0)
+        beta0_max = 1 - M_min - lambda0
+        if beta0_min >= beta0_max:
+            total_obj += 1e6
+            continue
+        beta0_test = np.linspace(beta0_min, beta0_max, 1000)
+        lambda1_vals = p['m1'] / (p['N0_base'] * beta0_test)
+        beta1_vals = p['m2'] / (p['N0_base'] * beta0_test)
+        W1_vals = 1 - beta1_vals - lambda1_vals
+        M0_vals = 1 - beta0_test - lambda0
+        feasible = (W1_vals >= W_min) & (W1_vals <= W_max) & (M0_vals > W1_vals + delta)
+        if not np.any(feasible):
+            total_obj += 1e6
+            continue
+        idx = np.where(feasible)[0][len(np.where(feasible)[0])//2]
+        beta0 = beta0_test[idx]
+        lambda1 = p['m1'] / (p['N0_base'] * beta0)
+        beta1 = p['m2'] / (p['N0_base'] * beta0)
+        m1_model = p['N0_base'] * beta0 * lambda1
+        m2_model = p['N0_base'] * beta0 * beta1
+        total_obj += ((m1_model - p['m1'])/p['m1'])**2 + ((m2_model - p['m2'])/p['m2'])**2
+    return total_obj
+
+result_level1 = differential_evolution(
+    level1_objective, [(0.05,0.5), (0.3,0.95), (0.05,0.5), (0.05,0.5)],
+    args=(params, 0.05), seed=42, maxiter=300, tol=1e-8, polish=True
+)
+M_min_opt, M_max_opt, W_min_opt, W_max_opt = result_level1.x
+
+print(f"Общие границы: M0=[{M_min_opt:.3f}, {M_max_opt:.3f}], W1=[{W_min_opt:.3f}, {W_max_opt:.3f}]")
+
+# ============================================================
+# 3. ГЕНЕРАЦИЯ ИСТИННЫХ ПАРАМЕТРОВ
+# ============================================================
+
+def generate_true_params(p, M_min, M_max, W_min, W_max, delta=0.05):
+    lambda0 = p['m0'] / p['N0_base']
+    beta0_min = max(0.001, 1 - M_max - lambda0)
+    beta0_max = 1 - M_min - lambda0
+
+    beta0_true = np.random.uniform(beta0_min, beta0_max)
+    lambda1_true = p['m1'] / (p['N0_base'] * beta0_true)
+    beta1_true = p['m2'] / (p['N0_base'] * beta0_true)
+    W1_true = 1 - beta1_true - lambda1_true
+    M0_true = 1 - beta0_true - lambda0
+
+    if W1_true < W_min or W1_true > W_max or M0_true < W1_true + delta:
+        beta0_test = np.linspace(beta0_min, beta0_max, 1000)
+        lambda1_vals = p['m1'] / (p['N0_base'] * beta0_test)
+        beta1_vals = p['m2'] / (p['N0_base'] * beta0_test)
+        W1_vals = 1 - beta1_vals - lambda1_vals
+        M0_vals = 1 - beta0_test - lambda0
+        feasible = (W1_vals >= W_min) & (W1_vals <= W_max) & (M0_vals > W1_vals + delta)
+        if np.any(feasible):
+            idx = np.where(feasible)[0][len(np.where(feasible)[0])//2]
+            beta0_true = beta0_test[idx]
+            lambda1_true = p['m1'] / (p['N0_base'] * beta0_true)
+            beta1_true = p['m2'] / (p['N0_base'] * beta0_true)
+            W1_true = 1 - beta1_true - lambda1_true
+            M0_true = 1 - beta0_true - lambda0
+
+    m2_true = p['N0_base'] * beta0_true * beta1_true
+
+    return {
+        'beta0': beta0_true, 'W1': W1_true,
+        'beta1': beta1_true, 'lambda1': lambda1_true,
+        'M0': M0_true, 'm2': m2_true
+    }
+
+# ============================================================
+# 4. RECOVERY TEST (только свободные параметры)
+# ============================================================
+
+def run_recovery_test(morph, p, M_min, M_max, W_min, W_max, 
+                       n_sims=20, noise_frac=0.15, delta=0.05):
+    results = []
+
+    print(f"\n=== {morph} RECOVERY TEST ({n_sims} sims) ===")
+    print("Проверяются только свободные параметры: beta0, W1")
+    print("Deterministic (beta1, lambda1, M0) не проверяются отдельно\n")
+
+    for sim in range(n_sims):
+        true = generate_true_params(p, M_min, M_max, W_min, W_max, delta)
+
+        m1_obs = p['m1']  # exact
+        m2_obs = max(np.random.normal(true['m2'], noise_frac * true['m2']), 10.0)
+
+        lambda0 = p['m0'] / p['N0_base']
+        beta0_min = max(0.001, 1 - M_max - lambda0)
+        beta0_max = 1 - M_min - lambda0
+
+        with pm.Model() as model:
+            beta0 = pm.Uniform('beta0', lower=beta0_min, upper=beta0_max)
+            W1 = pm.Uniform('W1', lower=W_min, upper=W_max)
+
+            lambda1 = pm.Deterministic('lambda1', p['m1'] / (p['N0_base'] * beta0))
+            beta1 = pm.Deterministic('beta1', 1 - W1 - lambda1)
+            M0 = pm.Deterministic('M0', 1 - beta0 - lambda0)
+
+            pred_m2 = p['N0_base'] * beta0 * (1 - W1 - lambda1)
+            pm.Normal('likelihood_m2', mu=pred_m2, sigma=0.05 * p['m2'], observed=m2_obs)
+
+            pm.Potential('M0_gt_W1', -10000 * pm.math.switch(M0 > W1 + delta, 0, (W1 + delta - M0)**2))
+
+            trace = pm.sample(2000, tune=1000, chains=4, cores=4,
+                             return_inferencedata=True,
+                             target_accept=0.95,
+                             random_seed=42+sim)
+
+        summary = az.summary(trace, var_names=['beta0', 'W1'],
+                             hdi_prob=0.95)
+        rhat_max = summary['r_hat'].max()
+        ess_min = summary['ess_bulk'].min()
+        divergences = trace.sample_stats.diverging.sum().values
+
+        # Recovery: только свободные параметры
+        recovered = {}
+        for param in ['beta0', 'W1']:
+            hdi = az.hdi(trace, var_names=[param], hdi_prob=0.95)
+            true_val = true[param]
+            lower = hdi[param].sel(hdi='lower').values
+            higher = hdi[param].sel(hdi='higher').values
+            recovered[param] = (lower <= true_val <= higher)
+
+        all_rec = all(recovered.values())
+        status = 'OK' if rhat_max < 1.01 and divergences == 0 and ess_min > 400 else 'WARN'
+
+        print(f"  Sim {sim+1}/{n_sims}: "
+              f"true(b0={true['beta0']:.3f}, W1={true['W1']:.3f}), "
+              f"m2_obs={m2_obs:.0f}, "
+              f"R-hat={rhat_max:.3f}, ESS={ess_min:.0f}, Div={divergences}, "
+              f"rec={sum(recovered.values())}/2, {status}")
+
+        results.append({
+            'sim': sim+1, 'm2_obs': m2_obs,
+            'beta0_true': true['beta0'], 'W1_true': true['W1'],
+            'beta1_true': true['beta1'], 'lambda1_true': true['lambda1'],
+            'M0_true': true['M0'],
+            'rhat_max': rhat_max, 'ess_min': ess_min, 'divergences': divergences,
+            'rec_beta0': recovered['beta0'], 'rec_W1': recovered['W1'],
+            'all_recovered': all_rec,
+            'status': status
+        })
+
+    return results
+
+all_results = {}
+for morph in ['Nosed', 'White']:
+    res = run_recovery_test(morph, params[morph], M_min_opt, M_max_opt, 
+                           W_min_opt, W_max_opt, n_sims=20, noise_frac=0.15)
+    all_results[morph] = res
+
+# ============================================================
+# 5. СВОДНАЯ ТАБЛИЦА В EXCEL
+# ============================================================
+
+rows = []
+for morph in ['Nosed', 'White']:
+    res = all_results[morph]
+    n_ok = sum(1 for r in res if r['status'] == 'OK')
+    n_warn = len(res) - n_ok
+
+    rec_beta0 = sum(r['rec_beta0'] for r in res)
+    rec_W1 = sum(r['rec_W1'] for r in res)
+    rec_all = sum(r['all_recovered'] for r in res)
+
+    # Итоговые строки
+    rows.append({
+        'Morph': morph,
+        'Sim': 'SUMMARY',
+        'Metric': 'Recovery_beta0_%',
+        'Value': f"{100*rec_beta0/len(res):.0f}",
+        'Detail': f"{rec_beta0}/{len(res)}"
+    })
+    rows.append({
+        'Morph': morph,
+        'Sim': 'SUMMARY',
+        'Metric': 'Recovery_W1_%',
+        'Value': f"{100*rec_W1/len(res):.0f}",
+        'Detail': f"{rec_W1}/{len(res)}"
+    })
+    rows.append({
+        'Morph': morph,
+        'Sim': 'SUMMARY',
+        'Metric': 'Recovery_all_free_params_%',
+        'Value': f"{100*rec_all/len(res):.0f}",
+        'Detail': f"{rec_all}/{len(res)}"
+    })
+    rows.append({
+        'Morph': morph,
+        'Sim': 'SUMMARY',
+        'Metric': 'OK_sims',
+        'Value': n_ok,
+        'Detail': f"{n_ok}/{len(res)}"
+    })
+    rows.append({
+        'Morph': morph,
+        'Sim': 'SUMMARY',
+        'Metric': 'WARN_sims',
+        'Value': n_warn,
+        'Detail': f"{n_warn}/{len(res)}"
+    })
+    rows.append({
+        'Morph': morph,
+        'Sim': 'SUMMARY',
+        'Metric': 'Max_Rhat',
+        'Value': f"{max(r['rhat_max'] for r in res):.3f}",
+        'Detail': ''
+    })
+    rows.append({
+        'Morph': morph,
+        'Sim': 'SUMMARY',
+        'Metric': 'Min_ESS',
+        'Value': f"{min(r['ess_min'] for r in res):.0f}",
+        'Detail': ''
+    })
+    rows.append({
+        'Morph': morph,
+        'Sim': 'SUMMARY',
+        'Metric': 'Total_divergences',
+        'Value': sum(r['divergences'] for r in res),
+        'Detail': ''
+    })
+
+    # Детальные строки
+    for r in res:
+        rows.append({
+            'Morph': morph,
+            'Sim': r['sim'],
+            'Metric': 'details',
+            'Value': f"b0_t={r['beta0_true']:.4f},W1_t={r['W1_true']:.4f},"
+                    f"b1_t={r['beta1_true']:.4f},l1_t={r['lambda1_true']:.4f},M0_t={r['M0_true']:.4f}",
+            'Detail': f"m2_obs={r['m2_obs']:.0f}|rhat={r['rhat_max']:.3f}|"
+                     f"ess={r['ess_min']:.0f}|div={r['divergences']}|"
+                     f"rec_b0={r['rec_beta0']}|rec_W1={r['rec_W1']}|"
+                     f"status={r['status']}"
+        })
+
+df_results = pd.DataFrame(rows)
+df_results.to_excel('Recovery_Results_v2.xlsx', index=False)
+
+print("\n" + "="*60)
+print("FINAL SUMMARY")
+print("="*60)
+
+for morph in ['Nosed', 'White']:
+    res = all_results[morph]
+    rec_all = sum(r['all_recovered'] for r in res)
+    n_ok = sum(1 for r in res if r['status'] == 'OK')
+    print(f"\n{morph}:")
+    print(f"  Free params recovered: {rec_all}/{len(res)} ({100*rec_all/len(res):.0f}%)")
+    print(f"  OK/WARN: {n_ok}/{len(res)-n_ok}")
+    print(f"  Max R-hat: {max(r['rhat_max'] for r in res):.3f}")
+    print(f"  Min ESS: {min(r['ess_min'] for r in res):.0f}")
+    print(f"  Total divergences: {sum(r['divergences'] for r in res)}")
+
+print("\nСохранено: Recovery_Results_v2.xlsx")
