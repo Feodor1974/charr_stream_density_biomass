@@ -1,0 +1,276 @@
+"""
+Recovery_Test_W1param_v6.py
+Simulation-based parameter recovery for the combined mortality model.
+Free parameters: beta0, W1.
+lambda1 is anchored to the observed count m1 with +/-5% counting
+uncertainty (lambda1 = m1/(N0*beta0) * u, u ~ Uniform(0.95, 1.05));
+lambda0 = m0/N0 remains exact. Synthetic observations are Poisson counts.
+True parameters are drawn uniformly from the full feasible space.
+The model is compiled once per morphotype; observations are updated via
+pm.set_data.
+Output: Recovery_Results_v6.xlsx
+"""
+
+import pandas as pd
+import numpy as np
+import pymc as pm
+import arviz as az
+from scipy.optimize import differential_evolution
+import warnings
+warnings.filterwarnings('ignore')
+
+np.random.seed(42)
+
+U_MIN = 0.95
+U_MAX = 1.05
+
+N_TUNE   = 1500
+N_DRAWS  = 1500
+N_CHAINS = 2
+T_ACCEPT = 0.92
+ESS_MIN  = 200
+N_SIMS   = 100
+
+# ============================================================
+# 1. READ DATA
+# ============================================================
+
+df = pd.read_excel('Combined_M.xlsx', header=0)
+df = df.set_index('Parameters')
+
+params = {}
+for morph in ['Nosed', 'White']:
+    params[morph] = {
+        'm0': df.loc['lambda_Age 0+', morph],
+        'm1': df.loc['lambda_Age 1+', morph],
+        'm2': df.loc['lambda_Age 2+', morph],
+        'n_spawn_min': df.loc['n_spawners_min', morph],
+        'n_spawn_max': df.loc['n_spawners_max', morph],
+        'fec_min': df.loc['fecundity_min', morph],
+        'fec_max': df.loc['fecundity_max', morph],
+        'egg_mort_min': df.loc['egg_mortality_min', morph],
+        'egg_mort_max': df.loc['egg_mortality_max', morph],
+    }
+
+for morph in ['Nosed', 'White']:
+    p = params[morph]
+    n_spawn = (p['n_spawn_min'] + p['n_spawn_max']) / 2
+    fec = (p['fec_min'] + p['fec_max']) / 2
+    egg_surv = 1 - (p['egg_mort_min'] + p['egg_mort_max']) / 2
+    p['N0_base'] = n_spawn * fec * egg_surv
+
+# ============================================================
+# 2. FEASIBLE BOUNDS (same procedure as the main model)
+# ============================================================
+
+def level1_objective(bounds, params, delta=0.05):
+    M_min, M_max, W_min, W_max = bounds
+    if M_min >= M_max or W_min >= W_max or M_min <= W_max + delta:
+        return 1e10
+    total_obj = 0
+    for morph in ['Nosed', 'White']:
+        p = params[morph]
+        lambda0 = p['m0'] / p['N0_base']
+        beta0_min = max(0.001, 1 - M_max - lambda0)
+        beta0_max = 1 - M_min - lambda0
+        if beta0_min >= beta0_max:
+            total_obj += 1e6
+            continue
+        beta0_test = np.linspace(beta0_min, beta0_max, 1000)
+        lambda1_vals = p['m1'] / (p['N0_base'] * beta0_test)
+        beta1_vals = p['m2'] / (p['N0_base'] * beta0_test)
+        W1_vals = 1 - beta1_vals - lambda1_vals
+        M0_vals = 1 - beta0_test - lambda0
+        feasible = (W1_vals >= W_min) & (W1_vals <= W_max) & (M0_vals > W1_vals + delta)
+        if not np.any(feasible):
+            total_obj += 1e6
+            continue
+    return total_obj
+
+result_level1 = differential_evolution(
+    level1_objective, [(0.05,0.5), (0.3,0.95), (0.05,0.5), (0.05,0.5)],
+    args=(params, 0.05), seed=42, maxiter=300, tol=1e-8, polish=True
+)
+M_min_opt, M_max_opt, W_min_opt, W_max_opt = result_level1.x
+
+print(f"Feasible bounds: M0=[{M_min_opt:.3f}, {M_max_opt:.3f}], W1=[{W_min_opt:.3f}, {W_max_opt:.3f}]")
+
+# ============================================================
+# 3. GENERATION OF TRUE PARAMETERS (full feasible space)
+# ============================================================
+
+def generate_true_params(p, M_min, M_max, W_min, W_max, delta=0.05):
+    lambda0 = p['m0'] / p['N0_base']
+    beta0_min = max(0.001, 1 - M_max - lambda0)
+    beta0_max = 1 - M_min - lambda0
+
+    beta0_test = np.linspace(beta0_min, beta0_max, 1000)
+    lambda1_dep = p['m1'] / (p['N0_base'] * beta0_test)
+    beta1_dep = p['m2'] / (p['N0_base'] * beta0_test)
+    W1_dep = 1 - beta1_dep - lambda1_dep
+    M0_dep = 1 - beta0_test - lambda0
+    feasible = (W1_dep >= W_min) & (W1_dep <= W_max) & (M0_dep > W1_dep + delta)
+
+    idx = np.random.choice(np.where(feasible)[0])
+    beta0_true = beta0_test[idx]
+    W1_true = np.random.uniform(W_min, W_max)
+    u_true = np.random.uniform(U_MIN, U_MAX)
+
+    lambda1_true = (p['m1'] / (p['N0_base'] * beta0_true)) * u_true
+    beta1_true = 1 - W1_true - lambda1_true
+    M0_true = 1 - beta0_true - lambda0
+
+    m1_true = p['N0_base'] * beta0_true * lambda1_true   # = m1 * u_true
+    m2_true = p['N0_base'] * beta0_true * beta1_true
+
+    return {'beta0': beta0_true, 'W1': W1_true, 'u': u_true,
+            'lambda1': lambda1_true, 'beta1': beta1_true, 'M0': M0_true,
+            'm1': m1_true, 'm2': m2_true}
+
+# ============================================================
+# 4. RECOVERY TEST
+# ============================================================
+
+def build_model(p, M_min, M_max, W_min, W_max, delta=0.05):
+    lambda0 = p['m0'] / p['N0_base']
+    beta0_min = max(0.001, 1 - M_max - lambda0)
+    beta0_max = 1 - M_min - lambda0
+
+    with pm.Model() as model:
+        beta0 = pm.Uniform('beta0', lower=beta0_min, upper=beta0_max)
+        W1 = pm.Uniform('W1', lower=W_min, upper=W_max)
+        u = pm.Uniform('u_m1', lower=U_MIN, upper=U_MAX)
+
+        lambda1 = pm.Deterministic('lambda1', (p['m1'] / (p['N0_base'] * beta0)) * u)
+        M0 = pm.Deterministic('M0', 1 - beta0 - lambda0)
+        beta1 = pm.Deterministic('beta1', 1 - W1 - lambda1)
+
+        mu_m2 = p['N0_base'] * beta0 * beta1
+        m2_obs = pm.Data('m2_obs', float(p['m2']))
+        pm.Poisson('likelihood_m2', mu=mu_m2, observed=m2_obs)
+
+        pm.Potential('M0_gt_W1',
+                     -10000 * pm.math.switch(M0 > W1 + delta, 0, (W1 + delta - M0)**2))
+    return model
+
+def run_recovery_test(morph, p, M_min, M_max, W_min, W_max, delta=0.05):
+    results = []
+    print(f"\n=== {morph} RECOVERY TEST ({N_SIMS} sims) ===")
+
+    model = build_model(p, M_min, M_max, W_min, W_max, delta)
+
+    for sim in range(N_SIMS):
+        true = generate_true_params(p, M_min, M_max, W_min, W_max, delta)
+        m1_obs = max(np.random.poisson(true['m1']), 1)
+        m2_obs = max(np.random.poisson(true['m2']), 1)
+
+        with model:
+            pm.set_data({'m2_obs': m2_obs})
+            trace = pm.sample(N_DRAWS, tune=N_TUNE,
+                              chains=N_CHAINS, cores=N_CHAINS,
+                              return_inferencedata=True,
+                              target_accept=T_ACCEPT,
+                              random_seed=42 + sim,
+                              progressbar=False,
+                              compute_convergence_checks=True)
+
+        summary = az.summary(trace, var_names=['beta0', 'W1'], hdi_prob=0.95)
+        rhat_max = summary['r_hat'].max()
+        ess_min = summary['ess_bulk'].min()
+        divergences = int(trace.sample_stats.diverging.sum().values)
+
+        recovered = {}
+        for param in ['beta0', 'W1']:
+            hdi = az.hdi(trace, var_names=[param], hdi_prob=0.95)
+            tv = true[param]
+            lower = hdi[param].sel(hdi='lower').values
+            higher = hdi[param].sel(hdi='higher').values
+            recovered[param] = bool(lower <= tv <= higher)
+
+        all_rec = all(recovered.values())
+        status = 'OK' if rhat_max < 1.01 and divergences == 0 and ess_min > ESS_MIN else 'WARN'
+
+        print(f"  Sim {sim+1}/{N_SIMS}: "
+              f"true(b0={true['beta0']:.3f}, W1={true['W1']:.3f}), "
+              f"m1={m1_obs}, m2={m2_obs}, R-hat={rhat_max:.3f}, ESS={ess_min:.0f}, "
+              f"Div={divergences}, rec={sum(recovered.values())}/2, {status}", flush=True)
+
+        results.append({
+            'sim': sim + 1, 'm1_obs': m1_obs, 'm2_obs': m2_obs,
+            'beta0_true': true['beta0'], 'W1_true': true['W1'], 'u_true': true['u'],
+            'lambda1_true': true['lambda1'], 'beta1_true': true['beta1'], 'M0_true': true['M0'],
+            'rhat_max': rhat_max, 'ess_min': ess_min, 'divergences': divergences,
+            'rec_beta0': recovered['beta0'], 'rec_W1': recovered['W1'],
+            'all_recovered': all_rec,
+            'status': status
+        })
+
+    return results
+
+all_results = {}
+for morph in ['Nosed', 'White']:
+    res = run_recovery_test(morph, params[morph],
+                            M_min_opt, M_max_opt, W_min_opt, W_max_opt)
+    all_results[morph] = res
+
+# ============================================================
+# 5. SUMMARY TABLE
+# ============================================================
+
+rows = []
+for morph in ['Nosed', 'White']:
+    res = all_results[morph]
+    n = len(res)
+    n_ok = sum(1 for r in res if r['status'] == 'OK')
+    rec_b0 = sum(r['rec_beta0'] for r in res)
+    rec_W1 = sum(r['rec_W1'] for r in res)
+    rec_all = sum(r['all_recovered'] for r in res)
+
+    rows.append({'Morph': morph, 'Sim': 'SUMMARY', 'Metric': 'Recovery_beta0_%',
+                 'Value': f"{100*rec_b0/n:.0f}", 'Detail': f"{rec_b0}/{n}"})
+    rows.append({'Morph': morph, 'Sim': 'SUMMARY', 'Metric': 'Recovery_W1_%',
+                 'Value': f"{100*rec_W1/n:.0f}", 'Detail': f"{rec_W1}/{n}"})
+    rows.append({'Morph': morph, 'Sim': 'SUMMARY', 'Metric': 'Recovery_all_free_params_%',
+                 'Value': f"{100*rec_all/n:.0f}", 'Detail': f"{rec_all}/{n}"})
+    rows.append({'Morph': morph, 'Sim': 'SUMMARY', 'Metric': 'OK_sims',
+                 'Value': n_ok, 'Detail': f"{n_ok}/{n}"})
+    rows.append({'Morph': morph, 'Sim': 'SUMMARY', 'Metric': 'WARN_sims',
+                 'Value': n - n_ok, 'Detail': f"{n-n_ok}/{n}"})
+    rows.append({'Morph': morph, 'Sim': 'SUMMARY', 'Metric': 'Max_Rhat',
+                 'Value': f"{max(r['rhat_max'] for r in res):.3f}", 'Detail': ''})
+    rows.append({'Morph': morph, 'Sim': 'SUMMARY', 'Metric': 'Min_ESS',
+                 'Value': f"{min(r['ess_min'] for r in res):.0f}", 'Detail': ''})
+    rows.append({'Morph': morph, 'Sim': 'SUMMARY', 'Metric': 'Total_divergences',
+                 'Value': sum(r['divergences'] for r in res), 'Detail': ''})
+
+    for r in res:
+        rows.append({
+            'Morph': morph, 'Sim': r['sim'], 'Metric': 'details',
+            'Value': f"b0_t={r['beta0_true']:.4f},W1_t={r['W1_true']:.4f},u_t={r['u_true']:.4f},"
+                    f"l1_t={r['lambda1_true']:.4f},b1_t={r['beta1_true']:.4f},M0_t={r['M0_true']:.4f}",
+            'Detail': f"m1={r['m1_obs']}|m2={r['m2_obs']}|rhat={r['rhat_max']:.3f}|"
+                     f"ess={r['ess_min']:.0f}|div={r['divergences']}|"
+                     f"rec_b0={r['rec_beta0']}|rec_W1={r['rec_W1']}|status={r['status']}"
+        })
+
+df_results = pd.DataFrame(rows)
+df_results.to_excel('Recovery_Results_v6.xlsx', index=False)
+
+print("\n" + "=" * 60)
+print("FINAL SUMMARY")
+print("=" * 60)
+for morph in ['Nosed', 'White']:
+    res = all_results[morph]
+    n = len(res)
+    rec_all = sum(r['all_recovered'] for r in res)
+    n_ok = sum(1 for r in res if r['status'] == 'OK')
+    print(f"\n{morph}:")
+    print(f"  Free params recovered: {rec_all}/{n} ({100*rec_all/n:.0f}%)")
+    print(f"  beta0: {sum(r['rec_beta0'] for r in res)}/{n} ({100*sum(r['rec_beta0'] for r in res)/n:.0f}%)")
+    print(f"  W1: {sum(r['rec_W1'] for r in res)}/{n} ({100*sum(r['rec_W1'] for r in res)/n:.0f}%)")
+    print(f"  OK/WARN: {n_ok}/{n-n_ok}")
+    print(f"  Max R-hat: {max(r['rhat_max'] for r in res):.3f}")
+    print(f"  Min ESS: {min(r['ess_min'] for r in res):.0f}")
+    print(f"  Total divergences: {sum(r['divergences'] for r in res)}")
+
+print("\nSaved: Recovery_Results_v6.xlsx")
