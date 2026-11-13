@@ -1,0 +1,125 @@
+"""
+Sensitivity_fix_v6.py
+Reruns the three failed scenarios (Nosed, -30% shift of each N0 component)
+with a safe initial value for beta0. Same model as Sensitivity_Analysis_N0_v6.
+Output: Sensitivity_fix_v6.xlsx
+"""
+
+import pandas as pd
+import numpy as np
+import pymc as pm
+import arviz as az
+from scipy.optimize import differential_evolution
+import warnings
+warnings.filterwarnings('ignore')
+
+np.random.seed(42)
+U_MIN, U_MAX = 0.95, 1.05
+
+# ---- data ----
+df = pd.read_excel('Combined_M.xlsx', header=0)
+df = df.set_index('Parameters')
+params = {}
+for morph in ['Nosed', 'White']:
+    params[morph] = {
+        'm0': df.loc['lambda_Age 0+', morph],
+        'm1': df.loc['lambda_Age 1+', morph],
+        'm2': df.loc['lambda_Age 2+', morph],
+        'n_spawn_min': df.loc['n_spawners_min', morph],
+        'n_spawn_max': df.loc['n_spawners_max', morph],
+        'fec_min': df.loc['fecundity_min', morph],
+        'fec_max': df.loc['fecundity_max', morph],
+        'egg_mort_min': df.loc['egg_mortality_min', morph],
+        'egg_mort_max': df.loc['egg_mortality_max', morph],
+    }
+
+# base values for BOTH morphotypes (this was the bug)
+for morph in ['Nosed', 'White']:
+    q = params[morph]
+    q['n_spawn_base'] = (q['n_spawn_min'] + q['n_spawn_max']) / 2
+    q['fec_base'] = (q['fec_min'] + q['fec_max']) / 2
+    q['egg_surv_base'] = 1 - (q['egg_mort_min'] + q['egg_mort_max']) / 2
+    q['N0_base'] = q['n_spawn_base'] * q['fec_base'] * q['egg_surv_base']
+    q['lambda0'] = q['m0'] / q['N0_base']
+
+# ---- bounds (same procedure) ----
+def level1_objective(bounds, params, delta=0.05):
+    M_min, M_max, W_min, W_max = bounds
+    if M_min >= M_max or W_min >= W_max or M_min <= W_max + delta:
+        return 1e10
+    total_obj = 0
+    for morph in ['Nosed', 'White']:
+        q = params[morph]
+        lambda0 = q['lambda0']
+        beta0_min = max(0.001, 1 - M_max - lambda0)
+        beta0_max = 1 - M_min - lambda0
+        if beta0_min >= beta0_max:
+            total_obj += 1e6
+            continue
+        beta0_test = np.linspace(beta0_min, beta0_max, 1000)
+        lambda1_vals = q['m1'] / (q['N0_base'] * beta0_test)
+        beta1_vals = q['m2'] / (q['N0_base'] * beta0_test)
+        W1_vals = 1 - beta1_vals - lambda1_vals
+        M0_vals = 1 - beta0_test - lambda0
+        feasible = (W1_vals >= W_min) & (W1_vals <= W_max) & (M0_vals > W1_vals + delta)
+        if not np.any(feasible):
+            total_obj += 1e6
+            continue
+    return total_obj
+
+result = differential_evolution(
+    level1_objective, [(0.05,0.5), (0.3,0.95), (0.05,0.5), (0.05,0.5)],
+    args=(params, 0.05), seed=42, maxiter=300, tol=1e-8, polish=True)
+M_min_opt, M_max_opt, W_min_opt, W_max_opt = result.x
+print(f"Feasible bounds: M0=[{M_min_opt:.3f}, {M_max_opt:.3f}], W1=[{W_min_opt:.3f}, {W_max_opt:.3f}]")
+
+# ---- run the three -30% scenarios (Nosed) ----
+p = params['Nosed']
+rows = []
+for shift_var in ['n_spawn', 'fec', 'egg_surv']:
+    N0_fixed = p['N0_base'] * 0.7
+    lambda0_s = p['m0'] / N0_fixed
+    beta0_min = max(0.001, 1 - M_max_opt - lambda0_s)
+    beta0_max = 1 - M_min_opt - lambda0_s
+    print(f"\n{shift_var} -30%: N0={N0_fixed:.0f}, lambda0={lambda0_s:.4f}, "
+          f"beta0:[{beta0_min:.4f},{beta0_max:.4f}]")
+
+    with pm.Model() as model:
+        beta0 = pm.Uniform('beta0', lower=beta0_min, upper=beta0_max)
+        W1 = pm.Uniform('W1', lower=W_min_opt, upper=W_max_opt)
+        u = pm.Uniform('u_m1', lower=U_MIN, upper=U_MAX)
+        lambda1 = pm.Deterministic('lambda1', (p['m1'] / (N0_fixed * beta0)) * u)
+        M0 = pm.Deterministic('M0', 1 - beta0 - lambda0_s)
+        beta1 = pm.Deterministic('beta1', 1 - W1 - lambda1)
+        mu_m2 = N0_fixed * beta0 * beta1
+        pm.Poisson('likelihood_m2', mu=mu_m2, observed=p['m2'])
+        pm.Potential('M0_gt_W1',
+                     -10000 * pm.math.switch(M0 > W1 + 0.05, 0, (W1 + 0.05 - M0)**2))
+        trace = pm.sample(1500, tune=1500, chains=2, cores=2,
+                         return_inferencedata=True, target_accept=0.92,
+                         progressbar=False, random_seed=42,
+                         initvals={'beta0': beta0_max - 0.005})
+
+    summary = az.summary(trace, var_names=['beta0', 'W1', 'M0', 'beta1', 'lambda1'],
+                         hdi_prob=0.95)
+    print(summary.to_string())
+    rhat_max = summary['r_hat'].max()
+    ess_min = summary['ess_bulk'].min()
+    div = int(trace.sample_stats.diverging.sum().values)
+    print(f"rhat={rhat_max:.3f}, ess_min={ess_min:.0f}, div={div}")
+    rows.append({
+        'Morph': 'Nosed', 'Shift_var': shift_var, 'Shift_pct': -30,
+        'N0_new': N0_fixed, 'lambda0_new': lambda0_s,
+        'beta0_mean': summary.loc['beta0', 'mean'],
+        'W1_mean': summary.loc['W1', 'mean'],
+        'M0_mean': summary.loc['M0', 'mean'],
+        'beta1_mean': summary.loc['beta1', 'mean'],
+        'lambda1_mean': summary.loc['lambda1', 'mean'],
+        'beta0_hdi_width': summary.loc['beta0', 'hdi_97.5%'] - summary.loc['beta0', 'hdi_2.5%'],
+        'W1_hdi_width': summary.loc['W1', 'hdi_97.5%'] - summary.loc['W1', 'hdi_2.5%'],
+        'rhat_max': rhat_max, 'ess_min': ess_min, 'divergences': div,
+        'stable': bool(rhat_max < 1.011 and div == 0 and ess_min > 200)
+    })
+
+pd.DataFrame(rows).to_excel('Sensitivity_fix_v6.xlsx', index=False)
+print("\nSaved: Sensitivity_fix_v6.xlsx")
