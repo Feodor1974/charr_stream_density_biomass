@@ -1,0 +1,194 @@
+"""
+Bayesian_RealData_W1param_v7.py
+Combined mortality model:
+  free parameters: beta0, W1
+  lambda1 anchored to observed m1 with +/-5% counting uncertainty:
+      lambda1 = (m1 / (N0 * beta0)) * u,   u ~ Uniform(0.95, 1.05)
+  lambda0 = m0 / N0 remains exact.
+  m2 enters via Poisson likelihood.
+v7: demographic group totals (N quantities) added as pm.Deterministic so
+    that their posterior summaries are exact (not products of means).
+Output: BayesianW1_Results_Summary_v7.xlsx
+"""
+
+import pandas as pd
+import numpy as np
+import pymc as pm
+import arviz as az
+from scipy.optimize import differential_evolution
+import warnings
+warnings.filterwarnings('ignore')
+
+np.random.seed(42)
+
+U_MIN = 0.95
+U_MAX = 1.05
+
+# ============================================================
+# 1. READ DATA
+# ============================================================
+
+df = pd.read_excel('Combined_M.xlsx', header=0)
+df = df.set_index('Parameters')
+
+params = {}
+for morph in ['Nosed', 'White']:
+    params[morph] = {
+        'm0': df.loc['lambda_Age 0+', morph],
+        'm1': df.loc['lambda_Age 1+', morph],
+        'm2': df.loc['lambda_Age 2+', morph],
+        'n_spawn_min': df.loc['n_spawners_min', morph],
+        'n_spawn_max': df.loc['n_spawners_max', morph],
+        'fec_min': df.loc['fecundity_min', morph],
+        'fec_max': df.loc['fecundity_max', morph],
+        'egg_mort_min': df.loc['egg_mortality_min', morph],
+        'egg_mort_max': df.loc['egg_mortality_max', morph],
+    }
+
+for morph in ['Nosed', 'White']:
+    p = params[morph]
+    n_spawn = (p['n_spawn_min'] + p['n_spawn_max']) / 2
+    fec = (p['fec_min'] + p['fec_max']) / 2
+    egg_surv = 1 - (p['egg_mort_min'] + p['egg_mort_max']) / 2
+    p['N0_base'] = n_spawn * fec * egg_surv
+    p['lambda0'] = p['m0'] / p['N0_base']
+
+print("=== BASE DATA ===")
+for morph in ['Nosed', 'White']:
+    p = params[morph]
+    print(f"{morph}: N0={p['N0_base']:.1f}, lambda0={p['lambda0']:.4f}, "
+          f"m0={p['m0']:.0f}, m1={p['m1']:.0f}, m2={p['m2']:.0f}")
+
+# ============================================================
+# 2. FEASIBLE BOUNDS
+# ============================================================
+
+def level1_objective(bounds, params, delta=0.05):
+    M_min, M_max, W_min, W_max = bounds
+    if M_min >= M_max or W_min >= W_max or M_min <= W_max + delta:
+        return 1e10
+    total_obj = 0
+    for morph in ['Nosed', 'White']:
+        p = params[morph]
+        lambda0 = p['m0'] / p['N0_base']
+        beta0_min = max(0.001, 1 - M_max - lambda0)
+        beta0_max = 1 - M_min - lambda0
+        if beta0_min >= beta0_max:
+            total_obj += 1e6
+            continue
+        beta0_test = np.linspace(beta0_min, beta0_max, 1000)
+        lambda1_vals = p['m1'] / (p['N0_base'] * beta0_test)
+        beta1_vals = p['m2'] / (p['N0_base'] * beta0_test)
+        W1_vals = 1 - beta1_vals - lambda1_vals
+        M0_vals = 1 - beta0_test - lambda0
+        feasible = (W1_vals >= W_min) & (W1_vals <= W_max) & (M0_vals > W1_vals + delta)
+        if not np.any(feasible):
+            total_obj += 1e6
+            continue
+    return total_obj
+
+result_level1 = differential_evolution(
+    level1_objective, [(0.05,0.5), (0.3,0.95), (0.05,0.5), (0.05,0.5)],
+    args=(params, 0.05), seed=42, maxiter=300, tol=1e-8, polish=True
+)
+M_min_opt, M_max_opt, W_min_opt, W_max_opt = result_level1.x
+
+print(f"Feasible bounds: M0=[{M_min_opt:.3f}, {M_max_opt:.3f}], W1=[{W_min_opt:.3f}, {W_max_opt:.3f}]")
+
+# ============================================================
+# 3. BAYESIAN MODEL
+# ============================================================
+
+all_summaries = {}
+SUM_VARS = ['beta0', 'M0', 'W1', 'beta1', 'lambda1',
+            'N_b0_Tt', 'N_M0_Tt', 'N_W1_Tt', 'N_b1_Tt', 'N_l1_Tt']
+
+for morph in ['Nosed', 'White']:
+    p = params[morph]
+    N0_fixed = p['N0_base']
+    lambda0 = p['lambda0']
+
+    beta0_min = max(0.001, 1 - M_max_opt - lambda0)
+    beta0_max = 1 - M_min_opt - lambda0
+
+    print(f"\n=== {morph} === beta0:[{beta0_min:.4f},{beta0_max:.4f}] W1:[{W_min_opt:.4f},{W_max_opt:.4f}]")
+
+    with pm.Model() as model:
+        beta0 = pm.Uniform('beta0', lower=beta0_min, upper=beta0_max)
+        W1 = pm.Uniform('W1', lower=W_min_opt, upper=W_max_opt)
+        u = pm.Uniform('u_m1', lower=U_MIN, upper=U_MAX)
+
+        lambda1 = pm.Deterministic('lambda1', (p['m1'] / (N0_fixed * beta0)) * u)
+        M0 = pm.Deterministic('M0', 1 - beta0 - lambda0)
+        beta1 = pm.Deterministic('beta1', 1 - W1 - lambda1)
+
+        # Demographic group totals (exact posterior summaries)
+        N_b0_Tt = pm.Deterministic('N_b0_Tt', N0_fixed * beta0)
+        N_M0_Tt = pm.Deterministic('N_M0_Tt', N0_fixed * M0)
+        N_W1_Tt = pm.Deterministic('N_W1_Tt', N0_fixed * beta0 * W1)
+        N_b1_Tt = pm.Deterministic('N_b1_Tt', N0_fixed * beta0 * beta1)
+        N_l1_Tt = pm.Deterministic('N_l1_Tt', N0_fixed * beta0 * lambda1)
+
+        mu_m2 = N0_fixed * beta0 * beta1
+        pm.Poisson('likelihood_m2', mu=mu_m2, observed=p['m2'])
+
+        pm.Potential('M0_gt_W1',
+                     -10000 * pm.math.switch(M0 > W1 + 0.05, 0, (W1 + 0.05 - M0)**2))
+
+        trace = pm.sample(1500, tune=1500, chains=2, cores=2,
+                         return_inferencedata=True,
+                         target_accept=0.92,
+                         progressbar=False,
+                         random_seed=42)
+
+    summary = az.summary(trace, var_names=SUM_VARS, hdi_prob=0.95)
+    all_summaries[morph] = summary
+
+    print(f"\n--- Posterior Summary ---")
+    print(summary.to_string())
+    rhat_max = summary['r_hat'].max()
+    ess_min = summary['ess_bulk'].min()
+    divergences = int(trace.sample_stats.diverging.sum().values)
+    print(f"Diagnostics: R-hat(max)={rhat_max:.3f}, ESS(min)={ess_min:.0f}, Divergences={divergences}")
+
+# ============================================================
+# 4. SUMMARY TABLE
+# ============================================================
+
+rows = []
+for morph in ['Nosed', 'White']:
+    summary = all_summaries[morph]
+    p = params[morph]
+    for param in ['beta0', 'M0', 'N_b0_Tt', 'N_M0_Tt']:
+        row = summary.loc[param]
+        rows.append({'Morph': morph, 'Parameter': param,
+                     'Mean': row['mean'], 'SD': row['sd'],
+                     'HDI_2.5%': row['hdi_2.5%'], 'HDI_97.5%': row['hdi_97.5%'],
+                     'ESS_bulk': row['ess_bulk'], 'R_hat': row['r_hat']})
+    rows.append({'Morph': morph, 'Parameter': 'lambda0',
+                 'Mean': p['lambda0'], 'SD': 0.0,
+                 'HDI_2.5%': p['lambda0'], 'HDI_97.5%': p['lambda0'],
+                 'ESS_bulk': np.nan, 'R_hat': np.nan})
+    for param in ['W1', 'beta1', 'lambda1', 'N_W1_Tt', 'N_b1_Tt', 'N_l1_Tt']:
+        row = summary.loc[param]
+        rows.append({'Morph': morph, 'Parameter': param,
+                     'Mean': row['mean'], 'SD': row['sd'],
+                     'HDI_2.5%': row['hdi_2.5%'], 'HDI_97.5%': row['hdi_97.5%'],
+                     'ESS_bulk': row['ess_bulk'], 'R_hat': row['r_hat']})
+
+df_results = pd.DataFrame(rows)
+df_results.to_excel('BayesianW1_Results_Summary_v7.xlsx', index=False)
+print("\nSaved: BayesianW1_Results_Summary_v7.xlsx")
+
+# ============================================================
+# 5. SUM CHECK
+# ============================================================
+
+print("\n=== SUM CHECK ===")
+for morph in ['Nosed', 'White']:
+    s = all_summaries[morph]
+    p = params[morph]
+    beta0, M0 = s.loc['beta0', 'mean'], s.loc['M0', 'mean']
+    W1, beta1, lambda1 = s.loc['W1', 'mean'], s.loc['beta1', 'mean'], s.loc['lambda1', 'mean']
+    print(f"{morph}: 0+: {beta0:.4f}+{p['lambda0']:.4f}+{M0:.4f} = {beta0+p['lambda0']+M0:.6f} | "
+          f"1+: {W1:.4f}+{beta1:.4f}+{lambda1:.4f} = {W1+beta1+lambda1:.6f}")
